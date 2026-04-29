@@ -39,10 +39,12 @@ Clawd Mochi sits on your desk and shows animated expressions on a small color di
 
 ### Extended Features (新增功能)
 
-- **Monitor** — 系统监控面板，从 NanoPi 获取负载、内存、温度、运行时间
+- **Monitor PC** — 系统监控面板，从PC获取负载、内存、温度、运行时间
 - **Reminder** — 定时提醒系统，最多5条提醒，自定义时间和消息
 - **Static Faces** — 7种静态表情（无语、问号、感叹号、生气、对号、叉叉、墨镜）
 - **Animated Faces** — 10种动画表情（挤眼睛、晕晕、闭眼睛、死掉了、等等、笑笑、看你、心跳、睡着了、尴尬）
+- **WiFi Provisioning** — AP配网模式，首次启动自动创建热点供用户配置
+- **Settings Page** — Web设置页面，可修改PC监控IP或重置WiFi配置
 
 ---
 
@@ -124,20 +126,31 @@ Go to **Tools** and set:
 
 ---
 
-## WiFi Configuration (WiFi 配置)
+## WiFi Configuration (WiFi 配网)
 
-本版本使用 **Station 模式**（WiFi客户端），连接到现有网络而非创建热点：
+本公版采用 **AP配网模式**，首次启动时自动创建热点供用户配置WiFi：
 
-| Setting      | Value            |
-| ------------ | ---------------- |
-| Mode         | Station (客户端) |
-| SSID         | `00000`          |
-| Password     | `83189906mac`    |
-| Static IP    | `192.168.2.233`  |
-| Gateway      | `192.168.2.1`    |
-| Web Server   | `http://192.168.2.233` |
+### 配网流程
 
-> 💡 如需修改 WiFi 配置，编辑 `clawd_mochi.ino` 开头的 `STA_SSID`、`STA_PASS` 和 `staticIP` 等变量。
+1. 首次启动或重置后，设备进入AP模式
+2. 使用手机/电脑连接WiFi热点：**`Clawd-Mochi-Setup`**（无密码）
+3. 打开浏览器访问：**`http://192.168.4.1`**
+4. 在配网页面选择/输入WiFi名称、密码、PC监控IP地址
+5. 点击"Save & Restart"，设备保存配置并重启
+6. 重启后自动连接用户WiFi，进入正常运行模式
+
+### 重置配网
+
+如需更换WiFi网络，可通过以下方式重置：
+
+**方式一：Web界面重置**
+1. 连接设备WiFi，打开Web控制器
+2. 点击"⚙ settings"按钮进入设置页面
+3. 点击红色的"Reset WiFi Config"按钮
+4. 确认后设备清除配置并重启，进入配网模式
+
+**方式二：GPIO重置（开发者功能）**
+- 启动时将 **GPIO 5** 拉低（接地），可清除WiFi配置重新配网
 
 ---
 
@@ -146,9 +159,8 @@ Go to **Tools** and set:
 ### Connect and open the controller
 
 1. Power the ESP32 via USB-C (any USB charger or power bank)
-2. Wait ~3 seconds for the boot animation to finish
-3. 确保设备已连接到 WiFi 网络 `00000`
-4. Open a browser and go to **`http://192.168.2.233`**
+2. Wait for boot animation and WiFi connection (screen shows connected status)
+3. Open a browser and go to the IP address shown on screen
 
 You should see the web controller:
 
@@ -183,29 +195,50 @@ Web 界面底部有提醒管理区域：
 
 ---
 
-## NanoPi Integration (NanoPi 集成)
+## PC Monitor Integration (PC监控集成)
 
-Monitor 和 Reminder 功能需要 NanoPi 提供 `stats.json`：
+Monitor 和 Reminder 功能需要运行PC上的监控脚本提供服务。
 
-### Required endpoint
+### 使用PC监控脚本
+
+项目提供 `pc_monitor/` 目录下的Python脚本：
+
+```bash
+cd pc_monitor
+pip install -r requirements.txt
+python pc_monitor.py
+```
+
+启动后脚本运行在 `http://你的PC IP:8080`，提供系统托盘图标和开机自启功能。
+
+详见：[`pc_monitor/README.md`](pc_monitor/README.md)
+
+### API接口
 
 ```
-https://192.168.2.1/stats.json
+http://<PC IP>:8080/stats.json
 ```
 
-### Required JSON fields
+### 返回JSON字段
 
 ```json
 {
-  "load": "0.5",
+  "load": "25.5",
   "mem": 45,
-  "temp": "42°C",
+  "temp": "42°C",   // Windows下可能为null
   "uptime": "3d 5h",
   "hour": 14,
   "minute": 30,
   "day": 27
 }
 ```
+
+> ⚠️ **Windows温度限制**: Windows系统下CPU温度获取受限，`temp`字段可能返回`null`。如需准确温度建议使用第三方工具。
+
+### 配置PC IP地址
+
+- 配网时在配网页面输入PC IP
+- 运行时通过Web控制器 → Settings → 修改PC IP
 
 Monitor 面板每 50 秒自动刷新数据。
 
@@ -302,14 +335,17 @@ Edit these constants near the top of `clawd_mochi.ino`:
 #define EYE_OY  40    // vertical offset upward
 ```
 
-### WiFi configuration
+### WiFi configuration (公版)
 
-```cpp
-const char* STA_SSID = "00000";
-const char* STA_PASS = "83189906mac";
-IPAddress staticIP(192, 168, 2, 233);
-IPAddress gateway(192, 168, 2, 1);
-```
+WiFi配置通过AP配网模式完成，无需修改代码：
+
+- 首次启动自动创建热点 `Clawd-Mochi-Setup`
+- 用户通过配网页面输入WiFi SSID、密码、PC监控IP
+- 配置保存到Preferences（非易失存储）
+
+### PC Monitor IP
+
+PC监控IP地址在配网时设置，也可通过Web设置页面修改。
 
 ### Monitor refresh interval
 

@@ -1,6 +1,7 @@
 /*
  * ╔══════════════════════════════════════════════════════════════╗
  *   CLAWD MOCHI — ESP32-C3 Super Mini + ST7789 1.54" 240×240
+ *   公版 - 支持WiFi配网 + PC系统监控
  *
  *   Wiring:
  *     SDA → GPIO 10  (hardware SPI MOSI)
@@ -12,7 +13,12 @@
  *     VCC → 3V3
  *     GND → GND
  *
- *   WiFi: SSID "00000" pw: "8318***06mac" → http://192.168.2.233
+ *   重置配网引脚: GPIO 5 (启动时拉低可清除WiFi配置重新配网)
+ *
+ *   WiFi配网流程:
+ *     首次启动 → AP模式(Clawd-Mochi-Setup, 192.168.4.1)
+ *     用户访问配网页面 → 输入WiFi密码 + PC监控IP → 保存配置
+ *     重启 → Station模式连接WiFi → 正常运行
  * ╚══════════════════════════════════════════════════════════════╝
  */
 
@@ -25,6 +31,7 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <WiFiClientSecure.h>
+#include <Preferences.h>
 
 // ── Pins ──────────────────────────────────────────────────────
 #define TFT_CS  4
@@ -34,14 +41,31 @@
 
 Adafruit_ST7789 tft = Adafruit_ST7789(TFT_CS, TFT_DC, TFT_RST);
 
-// ── WiFi (Station mode) ──────────────────────────────────────────────────────
-const char* STA_SSID = "00000";
-const char* STA_PASS = "83189906mac";
-IPAddress staticIP(192, 168, 2, 233);
-IPAddress gateway(192, 168, 2, 1);
-IPAddress subnet(255, 255, 255, 0);
-IPAddress dns(192, 168, 2, 1);
+// ── WiFi配网系统 ──────────────────────────────────────────────────────────────
+#define RESET_PIN        5    // 重置配网引脚（启动时拉低清除配置）
+#define AP_NAME          "Clawd-Mochi-Setup"
+#define AP_IP            "192.168.4.1"
+#define CONNECT_TIMEOUT  15000   // WiFi连接超时15秒
+
+Preferences preferences;
+
+// 配置存储字段
+String cfgSSID;
+String cfgPass;
+String cfgPcIp;      // PC监控IP地址
+
+// WiFi扫描缓存（AP配网时使用）
+#define MAX_SCAN_RESULTS 20
+String scanSSID[MAX_SCAN_RESULTS];
+int scanRSSI[MAX_SCAN_RESULTS];
+uint8_t scanCount = 0;
+
+// 配网模式标志
+bool inSetupMode = false;    // true = AP配网模式, false = Station运行模式
+bool wifiConnected = false;  // WiFi连接成功标志
+
 WebServer server(80);
+WebServer* setupServer = nullptr;  // 配网专用服务器
 
 // ── Display ───────────────────────────────────────────────────
 #define DISP_W 240
@@ -233,6 +257,57 @@ static const int16_t LOGO_SEGS[][4] PROGMEM = {
 //  HELPERS
 // ═════════════════════════════════════════════════════════════
 
+// ── 配置读写接口 ──────────────────────────────────────────────
+bool loadConfig() {
+  preferences.begin("clawd", true);  // readonly
+  cfgSSID = preferences.getString("ssid", "");
+  cfgPass = preferences.getString("pass", "");
+  cfgPcIp = preferences.getString("pcip", "");
+  preferences.end();
+  return (cfgSSID.length() > 0);  // 有WiFi配置返回true
+}
+
+void saveConfig(const String& ssid, const String& pass, const String& pcip) {
+  preferences.begin("clawd", false);  // write mode
+  preferences.putString("ssid", ssid);
+  preferences.putString("pass", pass);
+  preferences.putString("pcip", pcip);
+  preferences.end();
+}
+
+void clearConfig() {
+  preferences.begin("clawd", false);
+  preferences.clear();
+  preferences.end();
+  cfgSSID = "";
+  cfgPass = "";
+  cfgPcIp = "";
+}
+
+// ── WiFi预扫描（Station模式下扫描并缓存结果）──────────────────
+void scanWiFi() {
+  scanCount = 0;
+  Serial.println("Scanning WiFi...");
+  int n = WiFi.scanNetworks();
+  if (n <= 0) {
+    Serial.println("No networks found");
+    return;
+  }
+  Serial.printf("Found %d networks\n", n);
+  // 按信号强度排序，取前MAX_SCAN_RESULTS个
+  for (int i = 0; i < n && scanCount < MAX_SCAN_RESULTS; i++) {
+    scanSSID[scanCount] = WiFi.SSID(i);
+    scanRSSI[scanCount] = WiFi.RSSI(i);
+    // 去重
+    bool dup = false;
+    for (int j = 0; j < scanCount; j++) {
+      if (scanSSID[j] == scanSSID[scanCount]) { dup = true; break; }
+    }
+    if (!dup) scanCount++;
+  }
+  WiFi.scanDelete();
+}
+
 int speedMs(int ms) {
   if (animSpeed == 3) return ms / 2;
   if (animSpeed == 1) return ms * 2;
@@ -365,7 +440,7 @@ void drawMonitorPanel(const String& load, const String& mem, const String& temp,
 
   // Title
   tft.setTextColor(C_ORANGE); tft.setTextSize(2);
-  tft.setCursor(12, 16); tft.print("Monitor");
+  tft.setCursor(12, 16); tft.print("Monitor PC");
 
   // Data rows
   tft.setTextColor(C_WHITE); tft.setTextSize(2);
@@ -389,19 +464,25 @@ void fetchAndDrawMonitor() {
     return;
   }
 
+  // 检查PC IP是否配置
+  if (cfgPcIp.length() == 0) {
+    statsValid = false;
+    drawMonitorPanel("--", "--", "--", "No PC IP");
+    return;
+  }
+
   HTTPClient http;
   WiFiClientSecure client;
   client.setInsecure();  // 忽略证书验证
-  http.begin(client, "https://192.168.2.1/stats.json");
+  String url = "https://" + cfgPcIp + "/stats.json";
+  http.begin(client, url);
   http.setTimeout(5000);
   int httpCode = http.GET();
 
   Serial.print("HTTP code: ");
   Serial.println(httpCode);
-  Serial.print("WiFi status: ");
-  Serial.println(WiFi.status());
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  Serial.print("PC IP: ");
+  Serial.println(cfgPcIp);
 
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
@@ -422,7 +503,7 @@ void fetchAndDrawMonitor() {
       statsValid  = true;
       drawMonitorPanel(statsLoad, statsMem, statsTemp, statsUptime);
 
-      Serial.print("Time from NanoPi: ");
+      Serial.print("Time from PC: ");
       Serial.print(ntpHour < 10 ? "0" : "");
       Serial.print(ntpHour);
       Serial.print(":");
@@ -473,12 +554,19 @@ void drawReminder(const char* timeStr, const char* message) {
 void checkReminders() {
   if (reminderCount == 0) return;
 
-  // 先从NanoPi获取时间
+  // 检查PC IP是否配置
+  if (cfgPcIp.length() == 0) {
+    Serial.println("No PC IP, skip reminder check");
+    return;
+  }
+
+  // 先从PC获取时间
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     WiFiClientSecure client;
     client.setInsecure();
-    http.begin(client, "https://192.168.2.1/stats.json");
+    String url = "https://" + cfgPcIp + "/stats.json";
+    http.begin(client, url);
     http.setTimeout(5000);
     int httpCode = http.GET();
 
@@ -713,8 +801,506 @@ void animLogoReveal() {
 }
 
 // ═════════════════════════════════════════════════════════════
-//  WEB PAGE
+//  配网系统 (WiFi Setup - AP Mode)
 // ═════════════════════════════════════════════════════════════
+
+const char SETUP_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Clawd Mochi Setup</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#1c1c20;font-family:'Courier New',monospace;color:#e8e4dc;
+  display:flex;flex-direction:column;align-items:center;
+  padding:20px 14px;gap:14px;min-height:100vh}
+
+.hdr{text-align:center;padding:10px 0}
+.mascot{font-size:15px;color:#c96a3e;line-height:1.3;font-weight:bold}
+.sitename{font-size:10px;color:#5a5048;margin-top:8px;letter-spacing:3px}
+
+.sec{width:100%;max-width:390px;font-size:10px;color:#8a8278;
+  letter-spacing:2px;font-weight:bold;padding:0 2px;margin-top:8px}
+
+.form{width:100%;max-width:390px;display:flex;flex-direction:column;gap:10px}
+.field{display:flex;flex-direction:column;gap:4px}
+.lbl{font-size:11px;color:#c96a3e;font-weight:bold}
+.in{background:#0c1018;border:1.5px solid #38343a;border-radius:9px;
+  color:#d8d4dc;font-family:'Courier New',monospace;font-size:14px;
+  padding:12px;outline:none}
+.in:focus{border-color:#c96a3e}
+select.in{cursor:pointer}
+
+.btn{background:#c96a3e;border:none;border-radius:9px;color:#fff;
+  font-family:'Courier New',monospace;font-size:14px;font-weight:bold;
+  padding:14px;cursor:pointer;transition:all .12s}
+.btn:active{transform:scale(.95);background:#a05530}
+.btn:disabled{opacity:.5;cursor:default}
+
+.wlist{display:flex;flex-direction:column;gap:6px}
+.witem{background:#252428;border:1.5px solid #38343a;border-radius:8px;
+  color:#d8d4dc;font-family:'Courier New',monospace;font-size:12px;
+  padding:10px 12px;cursor:pointer;display:flex;justify-content:space-between;
+  align-items:center}
+.witem:active{background:#201408;border-color:#c96a3e}
+.witem.selected{border-color:#c96a3e;background:#201408}
+.rssi{font-size:10px;color:#6a6058}
+.rssi.good{color:#28b878}
+.rssi.ok{color:#c96a3e}
+.rssi.bad{color:#c06040}
+
+.tip{font-size:10px;color:#6a6058;text-align:center;padding:10px}
+.err{color:#c06040;font-size:12px;text-align:center;padding:8px}
+
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);
+  background:#252428;border:1.5px solid #38343a;border-radius:9px;
+  font-size:12px;color:#d8d4dc;padding:7px 16px;opacity:0;
+  transition:opacity .18s;pointer-events:none;white-space:nowrap;z-index:99}
+.toast.show{opacity:1}
+.toast.err{border-color:#c06040;color:#c06040}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <span class="mascot">&#x2590;&#x259B;&#x2588;&#x2588;&#x2588;&#x259C;&#x258C;<br>&#x259C;&#x2588;&#x2588;&#x2588;&#x2588;&#x2588;&#x259B;<br>&#x2598;&#x2598;&nbsp;&#x259D;&#x259D;</span>
+  <div class="sitename">WIFI SETUP</div>
+</div>
+
+<div class="sec">// Available Networks</div>
+<div class="wlist" id="wlist"></div>
+
+<div class="sec">// Manual Input (if not listed)</div>
+<div class="form">
+  <div class="field">
+    <span class="lbl">SSID (Network Name)</span>
+    <input class="in" id="ssid" type="text" placeholder="Enter WiFi name" autocomplete="off">
+  </div>
+  <div class="field">
+    <span class="lbl">Password</span>
+    <input class="in" id="pass" type="password" placeholder="Enter WiFi password" autocomplete="off">
+  </div>
+</div>
+
+<div class="sec">// PC Monitor Settings</div>
+<div class="form">
+  <div class="field">
+    <span class="lbl">PC IP Address (for system monitoring)</span>
+    <input class="in" id="pcip" type="text" placeholder="e.g. 192.168.1.100" autocomplete="off">
+  </div>
+</div>
+
+<div class="form" style="margin-top:10px">
+  <button class="btn" id="saveBtn" onclick="saveConfig()">Save & Restart</button>
+</div>
+
+<div class="tip">Connect your phone/PC to WiFi: <b>Clawd-Mochi-Setup</b></div>
+<div class="err" id="err"></div>
+<div class="toast" id="toast"></div>
+
+<script>
+let selectedSSID = '';
+let scanned = [];
+
+// Load scanned networks
+async function loadScan() {
+  try {
+    const r = await fetch('/scan');
+    scanned = await r.json();
+    renderWlist();
+  } catch(e) {
+    document.getElementById('err').textContent = 'Failed to load networks';
+  }
+}
+
+function renderWlist() {
+  const el = document.getElementById('wlist');
+  el.innerHTML = '';
+  if (scanned.length === 0) {
+    el.innerHTML = '<div class="tip">No networks found. Enter manually.</div>';
+    return;
+  }
+  scanned.forEach(w => {
+    const div = document.createElement('div');
+    div.className = 'witem';
+    const rssiClass = w.rssi > -50 ? 'good' : (w.rssi > -70 ? 'ok' : 'bad');
+    div.innerHTML = `<span>${w.ssid}</span><span class="rssi ${rssiClass}">${w.rssi}dBm</span>`;
+    div.onclick = () => selectWifi(w.ssid, div);
+    el.appendChild(div);
+  });
+}
+
+function selectWifi(ssid, el) {
+  selectedSSID = ssid;
+  document.getElementById('ssid').value = ssid;
+  document.querySelectorAll('.witem').forEach(e => e.classList.remove('selected'));
+  el.classList.add('selected');
+}
+
+function toast(msg, isError=false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (isError ? ' err' : '');
+  setTimeout(() => el.classList.remove('show'), 2000);
+}
+
+async function saveConfig() {
+  const ssid = document.getElementById('ssid').value.trim();
+  const pass = document.getElementById('pass').value;
+  const pcip = document.getElementById('pcip').value.trim();
+
+  if (!ssid) {
+    toast('Please enter SSID', true);
+    return;
+  }
+
+  const btn = document.getElementById('saveBtn');
+  btn.disabled = true;
+  btn.textContent = 'Saving...';
+
+  try {
+    const r = await fetch('/save?ssid=' + encodeURIComponent(ssid) +
+      '&pass=' + encodeURIComponent(pass) +
+      '&pcip=' + encodeURIComponent(pcip));
+    const j = await r.json();
+    if (j.ok) {
+      toast('Saved! Restarting...');
+      btn.textContent = 'Restarting...';
+    } else {
+      toast(j.error || 'Failed', true);
+      btn.disabled = false;
+      btn.textContent = 'Save & Restart';
+    }
+  } catch(e) {
+    toast('Connection lost', true);
+    btn.disabled = false;
+    btn.textContent = 'Save & Restart';
+  }
+}
+
+loadScan();
+</script>
+</body>
+</html>
+)rawhtml";
+
+// 配网服务器路由
+void setupRouteRoot() {
+  if (setupServer) {
+    setupServer->sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+    setupServer->send_P(200, "text/html", SETUP_HTML);
+  }
+}
+
+void setupRouteScan() {
+  String json = "[";
+  for (uint8_t i = 0; i < scanCount; i++) {
+    if (i > 0) json += ",";
+    json += "{\"ssid\":\"";
+    json += scanSSID[i];
+    json += "\",\"rssi\":";
+    json += scanRSSI[i];
+    json += "}";
+  }
+  json += "]";
+  if (setupServer) setupServer->send(200, "application/json", json);
+}
+
+void setupRouteSave() {
+  if (!setupServer) return;
+
+  String ssid = setupServer->arg("ssid");
+  String pass = setupServer->arg("pass");
+  String pcip = setupServer->arg("pcip");
+
+  if (ssid.length() == 0) {
+    setupServer->send(400, "application/json", "{\"error\":\"SSID required\"}");
+    return;
+  }
+
+  // 验证PC IP格式（简单验证）
+  if (pcip.length() > 0 && pcip.indexOf('.') < 0) {
+    setupServer->send(400, "application/json", "{\"error\":\"Invalid PC IP\"}");
+    return;
+  }
+
+  Serial.println("Saving config:");
+  Serial.println("  SSID: " + ssid);
+  Serial.println("  PC IP: " + pcip);
+
+  saveConfig(ssid, pass, pcip);
+
+  setupServer->send(200, "application/json", "{\"ok\":true}");
+
+  // 延迟重启
+  delay(500);
+  ESP.restart();
+}
+
+// 启动配网模式
+void startSetupMode() {
+  inSetupMode = true;
+  Serial.println("Entering setup mode (AP)");
+
+  // 显示配网界面
+  tft.fillScreen(C_DARKBG);
+  tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
+  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+  tft.setCursor(DISP_W/2 - 60, 16); tft.print("Setup Mode");
+  tft.setTextColor(C_WHITE); tft.setTextSize(2);
+  tft.setCursor(12, 50); tft.print("Connect to WiFi:");
+  tft.setTextColor(C_GREEN); tft.setTextSize(2);
+  tft.setCursor(12, 78); tft.print("Clawd-Mochi-Setup");
+  tft.setTextColor(C_WHITE); tft.setTextSize(2);
+  tft.setCursor(12, 106); tft.print("Open browser:");
+  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+  tft.setCursor(12, 134); tft.print("192.168.4.1");
+  tft.setTextColor(C_MUTED); tft.setTextSize(1);
+  tft.setCursor(12, 164); tft.print("Enter WiFi password & PC IP");
+
+  // 启动AP模式
+  WiFi.mode(WIFI_AP);
+  IPAddress apIP(192, 168, 4, 1);
+  WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(AP_NAME);  // 无密码开放热点
+
+  Serial.println("AP started: " + AP_NAME);
+  Serial.println("AP IP: " + WiFi.softAPIP().toString());
+
+  // 创建配网服务器
+  setupServer = new WebServer(80);
+  setupServer->on("/",        HTTP_GET, setupRouteRoot);
+  setupServer->on("/scan",    HTTP_GET, setupRouteScan);
+  setupServer->on("/save",    HTTP_GET, setupRouteSave);
+  setupServer->begin();
+
+  Serial.println("Setup server started");
+}
+
+// 处理配网模式循环
+void handleSetupLoop() {
+  if (setupServer) setupServer->handleClient();
+}
+
+// 尝试连接WiFi（Station模式）
+bool tryConnectWiFi() {
+  if (cfgSSID.length() == 0) return false;
+
+  Serial.println("Connecting to WiFi: " + cfgSSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(cfgSSID.c_str(), cfgPass.c_str());
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - start > CONNECT_TIMEOUT) {
+      Serial.println("WiFi connection timeout");
+      return false;
+    }
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.println("WiFi connected!");
+  Serial.println("IP: " + WiFi.localIP().toString());
+  return true;
+}
+
+// 显示WiFi连接状态
+void showConnectingScreen() {
+  tft.fillScreen(C_DARKBG);
+  tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
+  tft.setTextColor(C_WHITE); tft.setTextSize(2);
+  tft.setCursor(DISP_W/2 - 60, DISP_H/2 - 12);
+  tft.print("Connecting...");
+}
+
+void showConnectFailedScreen() {
+  tft.fillScreen(C_DARKBG);
+  tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
+  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+  tft.setCursor(DISP_W/2 - 70, 16); tft.print("Connection Failed");
+  tft.setTextColor(C_WHITE); tft.setTextSize(2);
+  tft.setCursor(12, 50); tft.print("SSID: ");
+  tft.print(cfgSSID);
+  tft.setTextColor(C_MUTED); tft.setTextSize(1);
+  tft.setCursor(12, 80); tft.print("Check password or reset");
+  tft.setCursor(12, 96); tft.print("Pull GPIO5 LOW at startup");
+  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+  tft.setCursor(DISP_W/2 - 50, 120); tft.print("Retrying...");
+}
+
+void showConnectedScreen() {
+  tft.fillScreen(C_DARKBG);
+  tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
+  tft.setTextColor(C_GREEN); tft.setTextSize(2);
+  tft.setCursor(DISP_W/2 - 70, 16); tft.print("WiFi Connected");
+  tft.setTextColor(C_WHITE); tft.setTextSize(2);
+  tft.setCursor(12, 50); tft.print("SSID: ");
+  tft.setTextColor(C_MUTED); tft.setTextSize(1);
+  tft.setCursor(60, 50); tft.print(cfgSSID);
+  tft.setTextColor(C_WHITE); tft.setTextSize(2);
+  tft.setCursor(12, 74); tft.print("IP: ");
+  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+  tft.setCursor(60, 74); tft.print(WiFi.localIP());
+  if (cfgPcIp.length() > 0) {
+    tft.setTextColor(C_WHITE); tft.setTextSize(1);
+    tft.setCursor(12, 102); tft.print("PC Monitor: ");
+    tft.setTextColor(C_MUTED); tft.setTextSize(1);
+    tft.setCursor(90, 102); tft.print(cfgPcIp);
+  }
+  tft.setTextColor(C_MUTED); tft.setTextSize(1);
+  tft.setCursor(DISP_W/2 - 80, 140); tft.print("Starting web server...");
+}
+
+// ═════════════════════════════════════════════════════════════
+//  WEB PAGE (Normal Operation)
+// ═════════════════════════════════════════════════════════════
+
+// 设置页面HTML
+const char SETTINGS_HTML[] PROGMEM = R"rawhtml(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Clawd Mochi Settings</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:#1c1c20;font-family:'Courier New',monospace;color:#e8e4dc;
+  display:flex;flex-direction:column;align-items:center;
+  padding:20px 14px;gap:14px;min-height:100vh}
+
+.hdr{text-align:center;padding:10px 0}
+.mascot{font-size:15px;color:#c96a3e;line-height:1.3;font-weight:bold}
+.sitename{font-size:10px;color:#5a5048;margin-top:8px;letter-spacing:3px}
+
+.sec{width:100%;max-width:390px;font-size:10px;color:#8a8278;
+  letter-spacing:2px;font-weight:bold;padding:0 2px;margin-top:8px}
+
+.form{width:100%;max-width:390px;display:flex;flex-direction:column;gap:10px}
+.field{display:flex;flex-direction:column;gap:4px}
+.lbl{font-size:11px;color:#c96a3e;font-weight:bold}
+.in{background:#0c1018;border:1.5px solid #38343a;border-radius:9px;
+  color:#d8d4dc;font-family:'Courier New',monospace;font-size:14px;
+  padding:12px;outline:none}
+.in:focus{border-color:#c96a3e}
+
+.btn{background:#c96a3e;border:none;border-radius:9px;color:#fff;
+  font-family:'Courier New',monospace;font-size:14px;font-weight:bold;
+  padding:14px;cursor:pointer;transition:all .12s}
+.btn:active{transform:scale(.95);background:#a05530}
+.btn:disabled{opacity:.5;cursor:default}
+.btn.back{background:#38343a}
+
+.tip{font-size:10px;color:#6a6058;text-align:center;padding:10px}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);
+  background:#252428;border:1.5px solid #38343a;border-radius:9px;
+  font-size:12px;color:#d8d4dc;padding:7px 16px;opacity:0;
+  transition:opacity .18s;pointer-events:none;white-space:nowrap;z-index:99}
+.toast.show{opacity:1}
+.toast.err{border-color:#c06040;color:#c06040}
+</style>
+</head>
+<body>
+
+<div class="hdr">
+  <span class="mascot">&#x2590;&#x259B;&#x2588;&#x2588;&#x2588;&#x259C;&#x258C;<br>&#x259C;&#x2588;&#x2588;&#x2588;&#x2588;&#x2588;&#x259B;<br>&#x2598;&#x2598;&nbsp;&#x259D;&#x259D;</span>
+  <div class="sitename">SETTINGS</div>
+</div>
+
+<div class="sec">// PC Monitor Configuration</div>
+<div class="form">
+  <div class="field">
+    <span class="lbl">PC IP Address</span>
+    <input class="in" id="pcip" type="text" placeholder="e.g. 192.168.1.100" autocomplete="off">
+  </div>
+  <button class="btn" onclick="savePcIp()">Save PC IP</button>
+</div>
+
+<div class="sec">// WiFi Reset</div>
+<div class="form">
+  <button class="btn" style="background:#c06040" onclick="confirmReset()">Reset WiFi Config</button>
+  <div class="tip">Reset will clear WiFi settings and restart into setup mode</div>
+</div>
+
+<div class="form" style="margin-top:20px">
+  <button class="btn back" onclick="goBack()">&#8592; Back to Controller</button>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+let currentPcIp = '';
+
+async function loadSettings() {
+  try {
+    const r = await fetch('/settings');
+    const j = await r.json();
+    currentPcIp = j.pcip || '';
+    document.getElementById('pcip').value = currentPcIp;
+  } catch(e) {
+    toast('Failed to load settings', true);
+  }
+}
+
+function toast(msg, isError=false) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show' + (isError ? ' err' : '');
+  setTimeout(() => el.classList.remove('show'), 2000);
+}
+
+async function savePcIp() {
+  const pcip = document.getElementById('pcip').value.trim();
+  if (pcip && pcip.indexOf('.') < 0) {
+    toast('Invalid IP format', true);
+    return;
+  }
+  try {
+    const r = await fetch('/settings?pcip=' + encodeURIComponent(pcip), {method:'POST'});
+    const j = await r.json();
+    if (j.ok) {
+      toast('PC IP saved!');
+      currentPcIp = pcip;
+    } else {
+      toast(j.error || 'Failed', true);
+    }
+  } catch(e) {
+    toast('Connection error', true);
+  }
+}
+
+function confirmReset() {
+  if (confirm('Are you sure you want to reset WiFi configuration?\nDevice will restart into setup mode.')) {
+    doReset();
+  }
+}
+
+async function doReset() {
+  try {
+    const r = await fetch('/reset', {method:'POST'});
+    const j = await r.json();
+    if (j.ok) {
+      toast('Resetting...');
+      setTimeout(() => location.reload(), 2000);
+    }
+  } catch(e) {
+    toast('Device is restarting...');
+  }
+}
+
+function goBack() {
+  window.location.href = '/';
+}
+
+loadSettings();
+</script>
+</body>
+</html>
+)rawhtml";
+
 const char INDEX_HTML[] PROGMEM = R"rawhtml(
 <!DOCTYPE html>
 <html lang="en">
@@ -870,6 +1456,7 @@ canvas{width:100%;border-radius:8px;border:1.5px solid #38343a;
 <div class="sec">// controls</div>
 <div class="ctrl">
   <button class="cbtn on" id="blBtn" onclick="toggleBL()">&#9728; display on</button>
+  <button class="cbtn" onclick="openSettings()">&#9881; settings</button>
 </div>
 
 <div class="sec">// views</div>
@@ -1081,6 +1668,11 @@ async function sendCmd(cmd) {
 }
 
 // ── Logo animations (kept for startup, not exposed in UI) ──────
+
+// ── Settings ───────────────────────────────────────────────────
+function openSettings() {
+  window.location.href = '/settings';
+}
 
 // ── Backlight ───────────────────────────────────────────────────
 async function toggleBL() {
@@ -1464,6 +2056,63 @@ String rgb565ToHex(uint16_t c) {
   return String(buf);
 }
 
+// /settings - 设置页面
+void routeSettingsPage() {
+  server.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
+  server.send_P(200, "text/html", SETTINGS_HTML);
+}
+
+// /settings API - 获取/设置PC IP
+void routeSettingsApi() {
+  // GET: 返回当前设置
+  if (server.method() == HTTP_GET) {
+    String j = "{\"ssid\":\"";
+    j += cfgSSID;
+    j += "\",\"pcip\":\"";
+    j += cfgPcIp;
+    j += "\"}";
+    server.send(200, "application/json", j);
+    return;
+  }
+
+  // POST: 更新PC IP
+  if (server.method() == HTTP_POST) {
+    if (server.hasArg("pcip")) {
+      String newPcIp = server.arg("pcip");
+      // 简单验证IP格式
+      if (newPcIp.length() > 0 && newPcIp.indexOf('.') < 0) {
+        server.send(400, "application/json", "{\"error\":\"invalid IP\"}");
+        return;
+      }
+      cfgPcIp = newPcIp;
+      // 保存到Preferences
+      preferences.begin("clawd", false);
+      preferences.putString("pcip", cfgPcIp);
+      preferences.end();
+      Serial.println("PC IP updated: " + cfgPcIp);
+      server.send(200, "application/json", "{\"ok\":true}");
+    } else {
+      server.send(400, "application/json", "{\"error\":\"missing pcip\"}");
+    }
+    return;
+  }
+
+  server.send(405, "application/json", "{\"error\":\"method not allowed\"}");
+}
+
+// /reset - 清除WiFi配置并重启
+void routeReset() {
+  if (server.method() == HTTP_POST) {
+    Serial.println("Reset requested via web");
+    server.send(200, "application/json", "{\"ok\":true}");
+    delay(500);
+    clearConfig();
+    ESP.restart();
+  } else {
+    server.send(405, "application/json", "{\"error\":\"use POST\"}");
+  }
+}
+
 void routeState() {
   String j = "{\"view\":"; j += currentView;
   j += ",\"busy\":";   j += busy        ? "true" : "false";
@@ -1581,8 +2230,11 @@ void routeNotFound() { server.send(404, "text/plain", "not found"); }
 
 void setup() {
   Serial.begin(115200);
+  delay(100);
 
+  // ── 硬件初始化 ────────────────────────────────────────────
   pinMode(TFT_BLK, OUTPUT);
+  pinMode(RESET_PIN, INPUT_PULLUP);  // 重置配网引脚
   setBacklight(true);
 
   SPI.begin(8, -1, 10, TFT_CS);   // SCK=8, MOSI=10
@@ -1596,45 +2248,77 @@ void setup() {
   tft.setTextColor(C_WHITE); tft.setTextSize(3);
   tft.setCursor(DISP_W / 2 - 54, DISP_H / 2 - 22); tft.print("Clawd");
   tft.setCursor(DISP_W / 2 - 54, DISP_H / 2 + 14); tft.print("Mochi");
-  delay(1200);
+  delay(800);
 
   // ── Logo shown once at startup ─────────────────────────────
   animLogoReveal();
 
-  // ── Start WiFi (Station mode) ───────────────────────────────
-  WiFi.mode(WIFI_STA);
-  WiFi.config(staticIP, gateway, subnet, dns);
-  WiFi.begin(STA_SSID, STA_PASS);
-
-  // ── Connecting screen ───────────────────────────────────────
-  tft.fillScreen(C_DARKBG);
-  tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
-  tft.setTextColor(C_WHITE);  tft.setTextSize(2);
-  tft.setCursor(DISP_W / 2 - 66, DISP_H / 2 - 12);
-  tft.print("Connecting...");
-
-  // Wait for connection
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    server.handleClient();  // keep server responsive if needed
+  // ── 检测重置引脚（GPIO5拉低清除配置）──────────────────────
+  if (digitalRead(RESET_PIN) == LOW) {
+    Serial.println("Reset pin LOW - clearing config");
+    clearConfig();
+    tft.fillScreen(C_DARKBG);
+    tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
+    tft.setTextColor(C_ORANGE); tft.setTextSize(2);
+    tft.setCursor(DISP_W/2 - 70, DISP_H/2 - 20);
+    tft.print("Config Cleared");
+    tft.setTextColor(C_MUTED); tft.setTextSize(1);
+    tft.setCursor(DISP_W/2 - 70, DISP_H/2 + 10);
+    tft.print("Release reset pin...");
+    delay(2000);
+    // 等待引脚释放
+    while (digitalRead(RESET_PIN) == LOW) delay(100);
   }
 
-  // ── WiFi info screen (connected) ─────────────────────────────
-  tft.fillScreen(C_DARKBG);
-  tft.fillRect(0, 0, DISP_W, 4, C_ORANGE);
-  tft.setTextColor(C_WHITE);  tft.setTextSize(2);
-  tft.setCursor(12, 16);  tft.print("WiFi Connected");
-  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
-  tft.setCursor(12, 44);  tft.print("SSID: 00000");
-  tft.setTextColor(C_WHITE);  tft.setTextSize(2);
-  tft.setCursor(12, 68);  tft.print("Open browser:");
-  tft.setTextColor(C_ORANGE); tft.setTextSize(2);
-  tft.setCursor(12, 94);  tft.print(WiFi.localIP());
-  tft.setTextColor(C_MUTED);  tft.setTextSize(1);
-  tft.setCursor(12, 124); tft.print("Time: --:--");
-  tft.setCursor(12, 140); tft.print("press any button to start");
+  // ── 读取配置 ──────────────────────────────────────────────
+  bool hasConfig = loadConfig();
+  Serial.println("Config loaded:");
+  Serial.println("  SSID: " + (cfgSSID.length() > 0 ? cfgSSID : "(empty)"));
+  Serial.println("  PC IP: " + (cfgPcIp.length() > 0 ? cfgPcIp : "(empty)"));
 
-  // ── Register routes ────────────────────────────────────────
+  // ── WiFi预扫描（在Station模式下扫描避免AP模式断连问题）──────
+  if (hasConfig) {
+    // 有配置，先扫描可用网络（用于后续显示）
+    WiFi.mode(WIFI_STA);
+    scanWiFi();
+    WiFi.mode(WIFI_OFF);  // 暂时关闭WiFi
+  } else {
+    // 无配置，先扫描（此时在Station模式扫描）
+    WiFi.mode(WIFI_STA);
+    scanWiFi();
+    WiFi.mode(WIFI_OFF);
+  }
+
+  // ── 根据配置决定启动模式 ─────────────────────────────────
+  if (!hasConfig) {
+    // 无WiFi配置 → 进入AP配网模式
+    startSetupMode();
+    return;  // setup结束，loop中处理配网
+  }
+
+  // ── 有WiFi配置 → Station模式连接 ───────────────────────────
+  showConnectingScreen();
+
+  if (!tryConnectWiFi()) {
+    // 连接失败
+    showConnectFailedScreen();
+    delay(3000);
+    // 重试一次
+    if (!tryConnectWiFi()) {
+      // 仍然失败，进入配网模式让用户重新配置
+      Serial.println("Connection failed, entering setup mode");
+      startSetupMode();
+      return;
+    }
+  }
+
+  // ── WiFi连接成功 ──────────────────────────────────────────
+  wifiConnected = true;
+  inSetupMode = false;
+  showConnectedScreen();
+  delay(1000);
+
+  // ── 启动Web服务器（正常运行模式）───────────────────────────
   server.on("/",            HTTP_GET, routeRoot);
   server.on("/cmd",         HTTP_GET, routeCmd);
   server.on("/char",        HTTP_GET, routeChar);
@@ -1645,12 +2329,18 @@ void setup() {
   server.on("/draw/stroke", HTTP_GET, routeDrawStroke);
   server.on("/backlight",   HTTP_GET, routeBacklight);
   server.on("/state",       HTTP_GET, routeState);
-  server.on("/reminder",    HTTP_ANY,  routeReminder);  // CRUD for reminders
+  server.on("/reminder",    HTTP_ANY,  routeReminder);
+  server.on("/settings",    HTTP_GET, routeSettingsPage);   // 设置页面
+  server.on("/settings",    HTTP_ANY,  routeSettingsApi);    // 设置API
+  server.on("/reset",       HTTP_POST, routeReset);          // 重置配网
   server.onNotFound(routeNotFound);
   server.begin();
 
-  // WiFi info stays on screen — first button press triggers setView/cmd
-  // which will replace it with the correct view
+  Serial.println("Web server started");
+  Serial.println("Ready! Open: " + WiFi.localIP().toString());
+
+  // 显示eyes动画作为默认视图
+  drawNormalEyes();
 }
 
 // ═════════════════════════════════════════════════════════════
@@ -1658,6 +2348,13 @@ void setup() {
 // ═════════════════════════════════════════════════════════════
 
 void loop() {
+  // ── 配网模式处理 ──────────────────────────────────────────
+  if (inSetupMode) {
+    handleSetupLoop();
+    return;  // 配网模式下不执行其他逻辑
+  }
+
+  // ── 正常运行模式 ──────────────────────────────────────────
   server.handleClient();
 
   unsigned long now = millis();

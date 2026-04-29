@@ -1,6 +1,8 @@
-# Clawd Mochi — ESP32-C3 Desk Companion
+# Clawd Mochi — ESP32-C3 Desk Companion (公版)
 
 A physical desk companion with animated eyes, web controller, terminal, canvas, monitor, and reminder features.
+
+**公版特性**: WiFi配网模式 + PC系统监控 + 设置页面
 
 ## Hardware
 
@@ -8,7 +10,8 @@ A physical desk companion with animated eyes, web controller, terminal, canvas, 
 |-----------|------|
 | MCU | ESP32-C3 Super Mini |
 | Display | ST7789 1.54" 240×240 TFT (SPI) |
-| WiFi | Station mode, static IP 192.168.2.233 |
+| WiFi | AP配网模式 + Station运行模式 |
+| Reset Pin | GPIO 5 (启动时拉低清除WiFi配置) |
 
 ### Pin Mapping
 
@@ -23,14 +26,19 @@ A physical desk companion with animated eyes, web controller, terminal, canvas, 
 | VCC | 3V3 (never 5V!) |
 | GND | GND |
 
-## WiFi Configuration
+## WiFi Configuration (公版配网系统)
 
-- **Mode**: Station (client)
-- **SSID**: `00000`
-- **Password**: `83189906mac`
-- **Static IP**: `192.168.2.233`
-- **Gateway**: `192.168.2.1`
-- **Web Server**: `http://192.168.2.233`
+**首次启动流程**:
+1. 检测Preferences中是否有WiFi配置
+2. 无配置 → 进入AP模式，创建热点 `Clawd-Mochi-Setup` (IP: 192.168.4.1)
+3. 用户访问配网页面，输入WiFi SSID/PW + PC监控IP
+4. 保存配置到Preferences，重启进入Station模式
+
+**重置配网**:
+- Web界面: Settings页面 → Reset WiFi Config
+- GPIO方式: 启动时将GPIO 5拉低
+
+**存储**: 使用Preferences库（命名空间"clawd"），字段：ssid、pass、pcip
 
 ## Views (currentView)
 
@@ -40,7 +48,7 @@ A physical desk companion with animated eyes, web controller, terminal, canvas, 
 | 1 | `VIEW_EYES_SQUISH` | Squish eyes animation (not in web UI) |
 | 2 | `VIEW_CODE` | Claude Code terminal display |
 | 3 | `VIEW_DRAW` | Canvas drawing mode |
-| 4 | `VIEW_MONITOR` | System stats from NanoPi |
+| 4 | `VIEW_MONITOR` | System stats from PC (Monitor PC) |
 | 5 | `VIEW_REMINDER` | Timed reminders display |
 
 ## Web API Endpoints
@@ -60,6 +68,8 @@ A physical desk companion with animated eyes, web controller, terminal, canvas, 
 | `/draw/stroke?pen=#RRGGBB&pts=x,y;x,y;...` | GET | Draw stroke on canvas |
 | `/state` | GET | Get current state JSON |
 | `/reminder` | GET/POST/PUT/DELETE | CRUD for reminders |
+| `/settings` | GET | Settings page (PC IP config, WiFi reset) |
+| `/reset` | POST | Clear WiFi config and restart |
 
 ### Command Keys (`/cmd?k=xxx`)
 
@@ -148,20 +158,25 @@ int speedMs(int ms) {
 }
 ```
 
-## Monitor System
+## Monitor System (公版PC监控)
 
-- Fetches `stats.json` via HTTPS from `192.168.2.1`
+- Fetches `stats.json` via HTTPS from user-configured PC IP
+- PC IP地址从Preferences读取（配网时设置或运行时通过Settings页面修改）
 - Auto-refresh every 50 seconds
-- Required fields: `load`, `mem`, `temp`, `uptime`, `hour`, `minute`, `day`
+- Required fields: `load`, `mem`, `temp` (Windows可能为null), `uptime`, `hour`, `minute`, `day`
+- 未配置PC IP时显示 "No PC IP" 提示
+
+**PC监控脚本**: `pc_monitor/pc_monitor.py`，提供系统托盘和开机自启功能
 
 ## Reminder System
 
 - Max 5 reminders
 - 20-char message limit
-- Uses NanoPi time (hour/minute/day from stats.json)
+- Uses PC time (hour/minute/day from stats.json)
 - 30-second display duration
 - Checks every minute (60000ms)
 - Web CRUD via `/reminder` endpoint
+- 未配置PC IP时跳过提醒检查
 
 ## Terminal System
 
