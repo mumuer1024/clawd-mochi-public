@@ -472,9 +472,8 @@ void fetchAndDrawMonitor() {
   }
 
   HTTPClient http;
-  WiFiClientSecure client;
-  client.setInsecure();  // 忽略证书验证
-  String url = "https://" + cfgPcIp + "/stats.json";
+  WiFiClient client;  // 使用HTTP客户端
+  String url = "http://" + cfgPcIp + "/stats.json";
   http.begin(client, url);
   http.setTimeout(5000);
   int httpCode = http.GET();
@@ -563,9 +562,8 @@ void checkReminders() {
   // 先从PC获取时间
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
-    WiFiClientSecure client;
-    client.setInsecure();
-    String url = "https://" + cfgPcIp + "/stats.json";
+    WiFiClient client;  // 使用HTTP客户端
+    String url = "http://" + cfgPcIp + "/stats.json";
     http.begin(client, url);
     http.setTimeout(5000);
     int httpCode = http.GET();
@@ -1027,8 +1025,8 @@ void setupRouteSave() {
   }
 
   Serial.println("Saving config:");
-  Serial.println("  SSID: " + ssid);
-  Serial.println("  PC IP: " + pcip);
+  Serial.println(String("  SSID: ") + ssid);
+  Serial.println(String("  PC IP: ") + pcip);
 
   saveConfig(ssid, pass, pcip);
 
@@ -1066,8 +1064,8 @@ void startSetupMode() {
   WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(AP_NAME);  // 无密码开放热点
 
-  Serial.println("AP started: " + AP_NAME);
-  Serial.println("AP IP: " + WiFi.softAPIP().toString());
+  Serial.println(String("AP started: ") + AP_NAME);
+  Serial.println(String("AP IP: ") + WiFi.softAPIP().toString());
 
   // 创建配网服务器
   setupServer = new WebServer(80);
@@ -1088,7 +1086,7 @@ void handleSetupLoop() {
 bool tryConnectWiFi() {
   if (cfgSSID.length() == 0) return false;
 
-  Serial.println("Connecting to WiFi: " + cfgSSID);
+  Serial.println(String("Connecting to WiFi: ") + cfgSSID);
   WiFi.mode(WIFI_STA);
   WiFi.begin(cfgSSID.c_str(), cfgPass.c_str());
 
@@ -1103,7 +1101,7 @@ bool tryConnectWiFi() {
   }
   Serial.println();
   Serial.println("WiFi connected!");
-  Serial.println("IP: " + WiFi.localIP().toString());
+  Serial.println(String("IP: ") + WiFi.localIP().toString());
   return true;
 }
 
@@ -2089,7 +2087,7 @@ void routeSettingsApi() {
       preferences.begin("clawd", false);
       preferences.putString("pcip", cfgPcIp);
       preferences.end();
-      Serial.println("PC IP updated: " + cfgPcIp);
+      Serial.println(String("PC IP updated: ") + cfgPcIp);
       server.send(200, "application/json", "{\"ok\":true}");
     } else {
       server.send(400, "application/json", "{\"error\":\"missing pcip\"}");
@@ -2273,8 +2271,8 @@ void setup() {
   // ── 读取配置 ──────────────────────────────────────────────
   bool hasConfig = loadConfig();
   Serial.println("Config loaded:");
-  Serial.println("  SSID: " + (cfgSSID.length() > 0 ? cfgSSID : "(empty)"));
-  Serial.println("  PC IP: " + (cfgPcIp.length() > 0 ? cfgPcIp : "(empty)"));
+  Serial.println(String("  SSID: ") + (cfgSSID.length() > 0 ? cfgSSID : String("(empty)")));
+  Serial.println(String("  PC IP: ") + (cfgPcIp.length() > 0 ? cfgPcIp : String("(empty)")));
 
   // ── WiFi预扫描（在Station模式下扫描避免AP模式断连问题）──────
   if (hasConfig) {
@@ -2337,7 +2335,7 @@ void setup() {
   server.begin();
 
   Serial.println("Web server started");
-  Serial.println("Ready! Open: " + WiFi.localIP().toString());
+  Serial.println(String("Ready! Open: ") + WiFi.localIP().toString());
 
   // 显示eyes动画作为默认视图
   drawNormalEyes();

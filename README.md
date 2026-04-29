@@ -405,20 +405,88 @@ To contribute: fork the repo, make your changes, and open a pull request. 请保
 
 ## License
 
-This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+本项目采用双协议许可方式：
 
-**Note:** 3D models and media assets are licensed under **CC BY-NC-SA 4.0**.
+### 代码许可 (MIT License)
+
+源代码（包括但不限于 `clawd_mochi.ino`、`faces_code.h`、`pc_monitor.py` 等）采用 **MIT License** 许可。
+
+```
+MIT License
+
+Copyright (c) 2026 Yousuf Amanuel
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+详见 [LICENSE](LICENSE) 文件。
+
+### 媒体资源许可 (CC BY-NC-SA 4.0)
+
+3D模型文件（`models/` 目录下的 `.stl`、`.3mf` 文件）、图片资源（`pics/` 目录）、以及图标文件（`icon/` 目录）采用 **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International (CC BY-NC-SA 4.0)** 许可。
+
+**您可以：**
+- **共享** — 以任何媒介或格式复制、发行本素材
+- **演绎** — 混合、转换或基于本素材进行创作
+
+**惟须遵守下列条件：**
+- **署名** — 您必须给出适当的署名，提供指向本许可协议的链接，同时表明是否（对原始素材）作了修改
+- **非商业性使用** — 您不得将本素材用于商业目的
+- **相同方式共享** — 若您再混合、转换或基于本素材进行创作，您必须以与原先许可协议相同的条款分发您贡献的素材
+
+完整许可协议详情：[https://creativecommons.org/licenses/by-nc-sa/4.0/](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 
 ---
 
-## Credits
+## Credits & Acknowledgments
 
-原版项目：[Clawd Mochi](https://github.com/original-repo) by original author
+### 原项目作者
 
-二次开发新增功能：
-- WiFi Station 模式 + 静态IP
-- Monitor 系统监控面板
-- Reminder 定时提醒系统
-- Face System 表情系统（代码绘制，7种静态+10种动画）
-- HTTPS 支持
-- Web UI 下拉菜单表情选择
+本项目基于 **Clawd Mochi** 原版进行二次开发。
+
+- **原作者**: Yousuf Amanuel
+- **原项目灵感**: Anthropic 的 Claude Code 官方吉祥物 Clawd（像素螃蟹）
+- **致谢**: 感谢原作者设计了这一可爱且实用的桌面伴侣项目，提供了完整的硬件设计、固件代码和3D模型，使得本项目得以在此基础上扩展更多功能
+
+### 二次开发贡献
+
+本二次开发版本新增以下功能：
+
+| 功能模块 | 说明 |
+|----------|------|
+| WiFi AP配网 | 首次启动自动创建热点，用户通过网页配置WiFi和PC IP |
+| Monitor 面板 | 系统监控显示（CPU负载、内存、温度、运行时间） |
+| Reminder 系统 | 定时提醒功能，最多5条提醒，自定义时间和消息 |
+| Face System | 表情系统（7种静态 + 10种动画，全部代码绘制） |
+| Settings 页面 | Web设置界面，可修改PC IP或重置WiFi配置 |
+| PC Monitor 服务 | Python监控脚本，提供HTTP API和系统托盘 |
+| 跨平台支持 | 开机自启支持（Windows/macOS/Linux） |
+| HTTPS 支持 | 安全HTTP请求支持 |
+
+---
+
+### 支持原项目
+
+如果您喜欢本项目，也请支持原作者：
+
+- 📦 **MakerWorld**: 下载原版3D打印模型 — [https://makerworld.com/en/models/2559505-clawd-mochi-physical-claude-code-mascot](https://makerworld.com/en/models/2559505-clawd-mochi-physical-claude-code-mascot)
+- ⭐ **GitHub**: 关注原项目获取最新更新
+- 💡 **反馈**: 通过Issues提交功能建议或Bug报告
+
+本项目遵循原项目的开源协议，欢迎社区贡献和改进！
