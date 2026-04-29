@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cp *)",
+      "Bash(copy *)"
+    ]
+  },
+  "$version": 3
+}
